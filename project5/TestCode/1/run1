@@ -1,0 +1,7 @@
+reset
+./makedisk disk1 21
+./formatdisk disk1 21
+./app1 disk1
+
+
+

@@ -1,0 +1,14 @@
+name : MOHAMAD BARHAM , ID: 215033965
+
+This programe is desighned to search for a specific word in multible files 
+ ** the number of files N must be between 1 and 20
+ ** max line length 80 character
+ ** file name max 127 character
+
+this programe is build on multi processes 
+ ** the mainn pprocess create N child proceses
+ ** each child process open one file and get the output
+ ** output from child process send to the main process by temp files
+ ** finally , after all children processes terminated , the main rea temp files and get the results
+
+good luck

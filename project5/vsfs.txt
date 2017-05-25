@@ -1,0 +1,941 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+
+#include "vsfs.h"
+
+// Global Variables
+char disk_name[128];   // name of virtual disk file
+int  disk_size;        // size in bytes - a power of 2
+int  disk_fd;          // disk file handle
+int  disk_blockcount;  // block count on disk
+
+struct openFileTableNode{
+	unsigned char fileDP;
+	unsigned short fileStartingBlock;
+	unsigned long fileSize;
+	unsigned long readWritePointer;
+	char fileName[128];
+	struct openFileTableNode * next;
+};
+
+struct openFileTableNode * openFileTablePointer;
+unsigned char maxFileDPNum;
+
+char * fatInMemoryPointer;
+char * directoryInMemoryPointer;
+unsigned short firstFreeBlock;
+
+/* read block blocknum into buffer buf */
+int getblock (int blocknum, void *buf)
+{      
+	int offset, n; 
+	
+	if (blocknum >= disk_blockcount) 
+		return (-1); //error
+
+	offset = lseek (disk_fd, blocknum * BLOCKSIZE, SEEK_SET); 
+	n = read (disk_fd, buf, BLOCKSIZE); 
+	if (n != BLOCKSIZE) 
+		return (-1); 
+
+	return (0); 
+}
+
+
+/* put buffer buf into block blocknum */
+int putblock (int blocknum, void *buf)
+{
+	int offset, n;
+	
+	if (blocknum >= disk_blockcount) 
+		return (-1); //error
+
+	offset = lseek (disk_fd, blocknum * BLOCKSIZE, SEEK_SET);
+	n = write (disk_fd, buf, BLOCKSIZE); 
+	if (n != BLOCKSIZE) 
+		return (-1); 
+
+	return (0); 
+}
+
+int getFileNumber(){//Gets the number of files in the disc//Test edildi
+	return ((unsigned short*)(fatInMemoryPointer+(disk_blockcount*4)+2))[0];
+}
+
+void setFileNumber(int newFileNumber){//Sets the number of files in the disc
+	((unsigned short*)(fatInMemoryPointer+(disk_blockcount*4)+2))[0] = newFileNumber;
+}
+
+unsigned short getFirstFreeBlock(){//Gets the number of first free block in the disc
+	return ((unsigned short*)(fatInMemoryPointer+(disk_blockcount*4)+4))[0];
+}
+
+void setFirstFreeBlock(unsigned short newFirstFreeBlockNum){//Sets the number of first free block in the disc
+	((unsigned short*)(fatInMemoryPointer+(disk_blockcount*4)+4))[0] = newFirstFreeBlockNum;
+}
+
+unsigned long getFatEntryStartingPoint(unsigned short blockNum){//Gets the memory address of FAT entry with its block number
+	return (fatInMemoryPointer+blockNum*4);
+}
+
+unsigned long getFileSizeFromDirectoryEntry(unsigned long directoryEntryStartingPoint){
+	//printf("\nfilesizeis %lu\n", ((unsigned long *)(directoryEntryStartingPoint+131))[0]);
+	return ((unsigned long *)(directoryEntryStartingPoint+131))[0];
+}
+
+unsigned short getFileStartingBlockAtFatFromDirectoryEntry(unsigned long directoryEntryStartingPoint){
+	return ((unsigned short *)(directoryEntryStartingPoint+129))[0];
+}
+
+void setFileSizeFromDirectoryEntry(unsigned long directoryEntryStartingPoint, unsigned long newNum){
+	((unsigned long *)(directoryEntryStartingPoint+131))[0] = newNum;
+	//printf ("\n\nfile size is: %lu\n\n", newNum);
+}
+
+void setFileStartingBlockAtFatFromDirectoryEntry(unsigned long directoryEntryStartingPoint, unsigned long newNum){
+	((unsigned short *)(directoryEntryStartingPoint+129))[0] = newNum;
+}
+
+int testExistanceOfNumberOfFreeBlocks(int numOfBlocks){
+	//printf("\nnumOfBlocksNeeded: %d\n", numOfBlocks);
+	unsigned long cur = getFatEntryStartingPoint(getFirstFreeBlock());
+	int i;
+	for(i=0; i<numOfBlocks; i++){
+		if(((unsigned short*)(cur+2))[0]==0)
+			return 0;
+		else
+			cur = getFatEntryStartingPoint(((unsigned short*)(cur+2))[0]);
+	}
+	return 1;
+}
+
+void allocateNewBlocks(unsigned long lastFatEntry, int numOfNewBlocksNeeded){
+	((unsigned short*)(lastFatEntry+2))[0] = getFirstFreeBlock();
+	unsigned long cur = lastFatEntry;
+	int i;
+	for(i=0;i<numOfNewBlocksNeeded; i++){
+		cur = getFatEntryStartingPoint(((unsigned short*)(cur+2))[0]);
+	}
+	setFirstFreeBlock(((unsigned short*)(cur+2))[0]);
+	((unsigned short*)(cur+2))[0] = 0;
+}
+
+void recursivelyDeleteOpenFileTable (struct openFileTableNode * cur){//Frees open file table recursively
+	if(cur->next!=NULL)
+		recursivelyDeleteOpenFileTable (cur->next);
+	
+	cur->next=NULL;
+	free(cur);
+}
+
+/* format disk of size dsize */
+int vsfs_format(char *vdisk, int dsize)//Test edildi
+{//size direk byte olarak geliyor
+	//vdisk disk adı	
+	strcpy (disk_name, vdisk); 
+	disk_size = dsize;  
+	disk_blockcount = disk_size / BLOCKSIZE; 
+
+	disk_fd = open (disk_name, O_RDWR); 
+	if (disk_fd == -1) {
+		printf ("disk open error %s\n", vdisk); 
+		exit(1); 
+	}
+	
+	// perform your format operations here. 
+	
+	int fatSize = disk_blockcount*4;//Set fat size as each entry is 4 bytes
+	//printf("\nfatSize: %d\n", fatSize);	
+	fatSize += 3;//For first free block pointer and file number in FAT
+	int numBlocksForFat = fatSize / BLOCKSIZE;//Number of entries in fat equals to the number of blocks in memory
+	//printf("\nnumBlocksForFat: %d\n", numBlocksForFat);
+	if(fatSize%BLOCKSIZE!=0)//If internal fragmentation occurs
+		numBlocksForFat++;//As it was integer division we need one more block
+	
+	
+	int i;
+	int diskBlock = 0;
+	unsigned short * buf = malloc(BLOCKSIZE);
+	for(i = 0; i<numBlocksForFat; i++){//Create fat file in number of necessary blocks
+		//printf("\n\nblock number : %d\n\n", i);
+		unsigned short * cur = buf;
+		int k;
+		for(k=0;k<1024;k++){//As the blocksize is 4 kb and entry in fat is 4 byte
+			if(diskBlock<disk_blockcount){
+				cur[0] = diskBlock;
+				//printf("\npointer address: %p", cur);
+				//printf("\ndiskBlock: %hu", cur[0]);
+				cur = cur + 1;
+				//printf("\npointer address2: %p", cur);
+				cur[0] = ++diskBlock;
+				//printf("nextBlock: %hu", cur[0]);
+				cur = cur + 1;
+			}else if(diskBlock==disk_blockcount){
+				cur[0] = diskBlock;
+				//printf("\ndiskBlock: %hu", cur[0]);
+				cur = cur + 1;
+				cur[0] = 0;
+				//printf("nextBlock: %hu", cur[0]);
+				cur = cur + 1;
+				diskBlock++;
+			}else if(diskBlock == disk_blockcount+1){
+				cur[0] = numBlocksForFat+5;//Assign the first free block in FAT
+				//printf("\nnumBlocksForFat: %hu", cur[0]);
+				cur = cur+1;
+				cur[0] = 0;//Assign the number of files as 0
+				//printf("number of files: %hu", cur[0]);
+				cur = cur + 1;
+				diskBlock++;
+			}else{
+				cur[0] = 0;
+				cur = cur+1;
+				cur[0] = 0;
+				cur = cur + 1;
+				diskBlock++;
+			}
+		}
+
+		//printf("\nblock put result: %d\n" ,putblock (i, buf));
+		putblock (i, buf);
+		
+		
+		//test
+		
+		/*void * buf2 = malloc(BLOCKSIZE);
+		unsigned short * cur2 = buf2;
+		unsigned short * cur1 = buf;
+		getblock(i, buf2);
+		int offset = 0;
+		for(k=0;k<2048;k++){//As the blocksize is 4 kb and entry in fat is 4 byte
+			//if(((unsigned short *)(cur2+2*k))[0]!=((unsigned short *)(cur1+2*k))[0])
+				printf("\nget:%hu, put:%hu, offset: %d", cur2[0], cur1[0], offset);
+				offset++;
+				cur2 = cur2 + 1;
+				cur1 = cur1 + 1;
+		}
+		free(buf2);*/
+		//test end
+	}
+	
+
+	
+	//printf("\nlast disk block number %d\n", diskBlock);
+
+	char * buff = buf;
+	buff[0] = '\0';
+	putblock (numBlocksForFat, buf);
+	
+	free(buf);
+	//Format complete
+	
+	//end of my code
+	
+	printf ("formatting disk=%s, size=%d\n", vdisk, disk_size); 
+
+	fsync (disk_fd); 
+	close (disk_fd); 
+
+	return (0); 
+}
+
+
+
+/* mount disk and its file system */
+int vsfs_mount (char *vdisk)//Test edildi
+{
+	unsigned char buffer[BLOCKSIZE]; 
+	struct stat finfo; 
+
+	strcpy (disk_name, vdisk);
+	disk_fd = open (disk_name, O_RDWR); 
+	if (disk_fd == -1) {
+		printf ("vsfs_mount: disk open error %s\n", disk_name); 
+		exit(1); 
+	}
+	
+	fstat (disk_fd, &finfo); 
+
+	printf ("vsfs_mount: mounting %s, size=%d\n", disk_name, 
+		(int) finfo.st_size);  
+	disk_size = (int) finfo.st_size; 
+	disk_blockcount = disk_size / BLOCKSIZE; 
+
+	//My code start
+	
+	openFileTablePointer = NULL;//Open file table is empty in the begining
+	maxFileDPNum = 0;//For keeping track of max DP num in order to give distinct DP numbers to the process
+	
+	//Bring fat table into memory
+	int fatSize = disk_blockcount*4;
+	fatSize += 3;//For first free block pointer and file number in FAT
+	
+	int numBlocksForFat = fatSize / BLOCKSIZE;
+	if(fatSize%BLOCKSIZE!=0)//If internal fragmentation occurs
+		numBlocksForFat++;//As it was integer division we need one more block
+	
+	fatInMemoryPointer = malloc(numBlocksForFat*BLOCKSIZE);//Allocate heap portion for FAT table
+	char * curPointerForFat= fatInMemoryPointer;//Iterator for FAT
+	int i;
+
+	unsigned short * buf = malloc(BLOCKSIZE);//Buffer for blocks
+	for(i = 0; i<numBlocksForFat; i++){//Create fat file in number of necessary blocks
+		getblock (i, buf);//Gets corresponding FAT memory from disc
+		char * curPointerForBuf = buf;//Iterator for buffer
+		int k;
+		for(k=0;k<BLOCKSIZE;k++){//Writes block into FAT portion in heap
+			curPointerForFat[0] = curPointerForBuf[0];
+			curPointerForFat++;
+			curPointerForBuf++;
+		}
+	}
+	
+	//End of bringing fat table into memory
+
+	
+	//Gets directory structure from disk into memory
+	directoryInMemoryPointer = malloc (17280);//As 128 files needs 17280 bytes of directory structure(140 bytes per file), worst case considered
+	char * curPointerForDirectory= directoryInMemoryPointer;//Iterator for dirctory portion in memory
+	unsigned short bytesTransferred= 0;//Counter for directory memory portion
+	for(i = numBlocksForFat; i<numBlocksForFat+5; i++){//Create directory file in number of necessary blocks
+		getblock (i, buf);
+		char * curPointerForBuf = buf;
+		int k;
+		for(k=0;k<1024;k++){
+			if(bytesTransferred<18000){
+				curPointerForDirectory[0] = curPointerForBuf[0];
+				curPointerForDirectory++;
+				curPointerForBuf++;
+				bytesTransferred++;
+			}else{k=1025;}
+		}
+	}
+	//End of get directory structure into memory
+	free(buf);
+	
+	//My code end
+	//test
+	/*unsigned short *testcur = fatInMemoryPointer;
+	int j;
+	for(j=0; j<numBlocksForFat*BLOCKSIZE; j++){
+		printf("\nfat block: %hu", testcur[0]);
+		testcur = testcur + 1;
+	}*/
+	//test end
+	// perform your mount operations here
+
+	return (0); 
+}
+
+int vsfs_umount()//Bunu en son test et
+{
+	// perform your unmount operations here
+	//Write FAT back to disc
+	
+	int fatSize = disk_blockcount*4;
+	fatSize += 3;//For first free block pointer and file number in FAT
+	
+	int numBlocksForFat = fatSize / BLOCKSIZE;
+	if(fatSize%BLOCKSIZE!=0)
+		numBlocksForFat++;//As it was integer division we need one more block
+	
+	char * curPointerForFat= fatInMemoryPointer;//Iterator for fat memory portion
+	int i;
+
+	unsigned short * buf = malloc(BLOCKSIZE);//Buffer for block write
+	for(i = 0; i<numBlocksForFat; i++){//Create fat file in number of necessary blocks
+		
+		char * curPointerForBuf = buf;//Iterator for buffer
+		int k;
+		for(k=0;k<BLOCKSIZE;k++){
+			curPointerForBuf[0] = curPointerForFat[0];
+			curPointerForFat++;
+			curPointerForBuf++;
+		}
+		putblock (i, buf);
+	}
+	//End of writing FAT back to disc
+	
+	//Put directory structure back into disc from memory
+	char * curPointerForDirectory= directoryInMemoryPointer;//Iterator for directory memory portion
+	unsigned short bytesTransferred= 0;//Counter for bytes transferred
+	for(i = numBlocksForFat; i<numBlocksForFat+5; i++){//Create directory file in number of necessary blocks
+
+		char * curPointerForBuf = buf;//Iterator for buffer
+		int k;
+		for(k=0;k<BLOCKSIZE;k++){
+			if(bytesTransferred<18000){
+				curPointerForBuf[0] = curPointerForDirectory[0];
+				curPointerForDirectory++;
+				curPointerForBuf++;
+				bytesTransferred++;
+			}else{k=BLOCKSIZE+1;}
+		}
+		putblock (i, buf);
+	}
+	//End of putting directory structure back into disc from memory
+	free(buf);
+
+	
+	free(directoryInMemoryPointer);//Free directory in memory
+	free(fatInMemoryPointer);//Free fat table in memory
+	
+	if(openFileTablePointer!=NULL){//Free open file table if not empty
+		recursivelyDeleteOpenFileTable(openFileTablePointer);
+	}
+	
+	fsync (disk_fd); 
+	close (disk_fd); 
+}
+
+/* create a file with name filename */
+int vsfs_create(char *filename)//Test edildi
+{
+	//printf("\ncurrent number of files: %hu\n", getFileNumber());
+	if(getFileNumber()==128){//File system is full(there are 128 files)
+		return -1;
+	}else if(getFileNumber()==0){//If there are no files
+		strcpy ((char *)directoryInMemoryPointer, filename);//Copy the file name
+		
+		setFileStartingBlockAtFatFromDirectoryEntry(directoryInMemoryPointer, getFirstFreeBlock());//Sets starting block
+
+		setFirstFreeBlock(getFirstFreeBlock()+1);//Resets new free block
+
+		setFileSizeFromDirectoryEntry(directoryInMemoryPointer, 0);//Sets file size as 0
+		
+		(directoryInMemoryPointer+140)[0] = '\0';//Set the next file as null
+			
+		((unsigned short *)(getFatEntryStartingPoint(getFileStartingBlockAtFatFromDirectoryEntry(directoryInMemoryPointer))+2))[0] = 0;//Set next pointer of allocated block to 0
+		
+		setFileNumber(1);
+		
+		//test
+		/*printf("\nfile name is: %s\n", (char*)directoryInMemoryPointer);
+		printf("\nfile starting point from directory entry: %hu\n" , getFileStartingBlockAtFatFromDirectoryEntry(directoryInMemoryPointer));
+		printf("\nfirst free block %hu\n" ,getFirstFreeBlock());
+		printf("\nfile size: %hu\n" ,getFileSizeFromDirectoryEntry(directoryInMemoryPointer));
+		printf("\nnext pointer of block: %hu\n" ,((unsigned short *)(getFatEntryStartingPoint(getFileStartingBlockAtFatFromDirectoryEntry(directoryInMemoryPointer))+2))[0]);
+		if((directoryInMemoryPointer+140)[0]=='\0')
+			printf("\nnext entry of directory is null");*/
+		//end test
+	}else{//If there is at least one file in the directory
+		if(getFirstFreeBlock() == 0){//There is no free block to allocate
+			return -1;
+		}else{//If there is at least one free block
+			char * curPointerForDirectory = directoryInMemoryPointer;//Iterator on directory
+			while((curPointerForDirectory)[0]!='\0'){//Find the last directory entry
+				curPointerForDirectory += 140;
+				//printf("hello from the other side");
+			}
+			strcpy (curPointerForDirectory, filename);//Set new file name
+			
+			setFileStartingBlockAtFatFromDirectoryEntry(curPointerForDirectory, getFirstFreeBlock());
+			
+			setFirstFreeBlock(((unsigned short*)(getFatEntryStartingPoint(getFirstFreeBlock())+2))[0]);//Resets new free block
+
+			setFileSizeFromDirectoryEntry(curPointerForDirectory, 0);
+			
+			(curPointerForDirectory+140)[0] = '\0';//Set the next file as null
+			
+			((unsigned short *)(getFatEntryStartingPoint(getFileStartingBlockAtFatFromDirectoryEntry(curPointerForDirectory))+2))[0] = 0;//Set next pointer of allocated block to 0
+			
+			setFileNumber(getFileNumber()+1);//Sets new file number
+			//test
+			/*printf("\nfile name is: %s\n", (char*)curPointerForDirectory);
+			printf("\nfile starting point from directory entry: %hu\n" , getFileStartingBlockAtFatFromDirectoryEntry(curPointerForDirectory));
+			printf("\nfirst free block %hu\n" ,getFirstFreeBlock());
+			printf("\nfile size: %hu\n" ,getFileSizeFromDirectoryEntry(curPointerForDirectory));
+			printf("\nnext pointer of block: %hu\n" ,((unsigned short *)(getFatEntryStartingPoint(getFileStartingBlockAtFatFromDirectoryEntry(curPointerForDirectory))+2))[0]);
+			if((curPointerForDirectory+140)[0]=='\0')
+				printf("\nnext entry of directory is null");*/
+			//end test
+		}
+	}
+	return (0); 
+}
+
+/* open file filename */
+int vsfs_open(char *filename)
+{
+
+	struct openFileTableNode *cur = openFileTablePointer;
+	while(cur!=NULL && strcmp(cur->fileName, filename)!=0){
+		cur=cur->next;
+	}
+	if(cur!=NULL && strcmp(cur->fileName, filename)!=0)
+		return -1;//Above checks whether the file is already opened or not
+	
+	unsigned long curPointerForDirectory = directoryInMemoryPointer;
+	
+	//printf("\n\ndirectoryInMemoryPointer: %p, cur: %lu\n\n", directoryInMemoryPointer, curPointerForDirectory);
+	
+	while(((char*)curPointerForDirectory)[0]!='\0' && strcmp((char*)curPointerForDirectory, filename)!=0){
+		curPointerForDirectory += 140;
+	}
+	if(((char*)curPointerForDirectory)[0]!='\0'){
+		if(maxFileDPNum==0){//If it is the first file to be opened
+			openFileTablePointer = malloc(sizeof(struct openFileTableNode));
+			openFileTablePointer->fileDP = 1;
+			openFileTablePointer->fileSize = getFileSizeFromDirectoryEntry(curPointerForDirectory);
+			openFileTablePointer->fileStartingBlock = getFileStartingBlockAtFatFromDirectoryEntry(curPointerForDirectory);
+			openFileTablePointer->readWritePointer = 0;
+			openFileTablePointer->next = NULL;
+			strcpy(openFileTablePointer->fileName, curPointerForDirectory);
+			maxFileDPNum = 1;
+			//test
+			//printf("\nfile PD: %d, fileSize: %lu, fileStartingBlock: %hu\n", openFileTablePointer->fileDP, getFileSizeFromDirectoryEntry(curPointerForDirectory), openFileTablePointer->fileStartingBlock);
+			//end test
+			return 1;
+		}else{//If it is not the first file to be opened
+			struct openFileTableNode *cur = openFileTablePointer;
+			while(cur->next!=NULL)
+				cur=cur->next;
+			cur->next = malloc(sizeof(struct openFileTableNode));
+			cur->next->fileDP = ++maxFileDPNum;
+			cur->next->fileSize = getFileSizeFromDirectoryEntry(curPointerForDirectory);
+			cur->next->fileStartingBlock = getFileStartingBlockAtFatFromDirectoryEntry(curPointerForDirectory);
+			cur->next->readWritePointer = 0;
+			cur->next->next = NULL;
+			strcpy(openFileTablePointer->fileName, curPointerForDirectory);
+			//test
+			//printf("\nfile PD: %d, fileSize: %lu, fileStartingBlock: %hu\n", cur->next->fileDP, cur->next->fileSize, cur->next->fileStartingBlock);
+			//end test
+			return maxFileDPNum;
+		}
+	}else{
+		return -1;
+	}
+}
+
+/* close file filename */
+int vsfs_close(int fd)//Test edildi
+{		
+	if(openFileTablePointer!=NULL){
+		if(openFileTablePointer->fileDP = fd){
+			struct openFileTableNode *cur = openFileTablePointer;
+			openFileTablePointer = openFileTablePointer->next;
+			cur->next = NULL;
+			free(cur);
+			if(fd == maxFileDPNum){
+				int newMaxFileDPNum = 0;
+				cur = openFileTablePointer;
+				while(cur!=NULL){
+					if(cur->fileDP > newMaxFileDPNum)
+						newMaxFileDPNum = cur->fileDP;
+					cur = cur->next;
+				}
+				maxFileDPNum = newMaxFileDPNum;
+			}
+			return 0;	
+		}else{
+			struct openFileTableNode *cur = openFileTablePointer;
+			while(cur!=NULL&&cur->next!=NULL&&cur->next->fileDP!=fd)
+				cur=cur->next;
+			if(cur!=NULL&&cur->next!=NULL&&cur->next->fileDP==fd){
+				struct openFileTableNode *curToBeDeleted = cur->next;
+				cur->next = cur->next->next;
+				curToBeDeleted->next=NULL;
+				free(curToBeDeleted);
+				
+				if(fd == maxFileDPNum){
+					int newMaxFileDPNum = 0;
+					cur = openFileTablePointer;
+					while(cur!=NULL){
+						if(cur->fileDP > newMaxFileDPNum)
+							newMaxFileDPNum = cur->fileDP;
+						cur = cur->next;
+					}
+					maxFileDPNum = newMaxFileDPNum;
+				}
+				return 0;	
+			}else{
+				return -1;
+			}
+		}
+	}
+}
+
+int vsfs_delete(char *filename)//Test edildi
+{
+	char * curPointerForDirectory = directoryInMemoryPointer;
+	while(curPointerForDirectory[0]!='\0'&&strcmp(curPointerForDirectory, filename)!=0){
+		curPointerForDirectory += 140;
+	}
+
+	if(curPointerForDirectory[0]!='\0'){
+
+		unsigned long sizeOfFileToBeDeleted = getFileSizeFromDirectoryEntry(curPointerForDirectory);
+		int numOfBlocksToBeDeleted = sizeOfFileToBeDeleted/BLOCKSIZE;
+		if(sizeOfFileToBeDeleted%BLOCKSIZE!=0)
+			numOfBlocksToBeDeleted++;
+		//unsigned short *curFatPointer = fatInMemoryPointer + getFileStartingBlockAtFatFromDirectoryEntry(curPointerForDirectory)*4;
+		unsigned short *curFatPointer = getFatEntryStartingPoint(getFileStartingBlockAtFatFromDirectoryEntry(curPointerForDirectory));
+
+		
+		int i;
+		for(i = 0; i<numOfBlocksToBeDeleted-1;i++){
+			curFatPointer = getFatEntryStartingPoint((curFatPointer+1)[0]);
+		}
+		(curFatPointer+1)[0] = getFirstFreeBlock();
+
+		setFirstFreeBlock(getFileStartingBlockAtFatFromDirectoryEntry(curPointerForDirectory));
+
+		if(getFileNumber()==1){
+			directoryInMemoryPointer[0] = '\0';//Delete the only entry
+			setFileNumber(0);
+
+		}else{
+
+			char * lastPointerForDirectory = directoryInMemoryPointer;//Iterator directory entry
+			while(lastPointerForDirectory[0]!='\0' && (lastPointerForDirectory+140)[0]!='\0'){//Find the last directory entry
+				lastPointerForDirectory += 140;
+			}
+			//printf("\n\nlastPointerForDirectory %s, curPointerForDirectory: %s\n\n", lastPointerForDirectory, curPointerForDirectory);
+			if(lastPointerForDirectory!=curPointerForDirectory)
+				strcpy(curPointerForDirectory, lastPointerForDirectory);//Change file name with the last entry's
+		
+			setFileStartingBlockAtFatFromDirectoryEntry(curPointerForDirectory, getFileStartingBlockAtFatFromDirectoryEntry(lastPointerForDirectory));
+		
+			setFileSizeFromDirectoryEntry(curPointerForDirectory, getFileSizeFromDirectoryEntry(lastPointerForDirectory));
+		
+			lastPointerForDirectory[0] = '\0';//Delete the last entry
+			setFileNumber(getFileNumber()-1);
+		}
+		//If file is opened, close the file
+		struct openFileTableNode * curOpenFileTable = openFileTablePointer;
+		
+		while(curOpenFileTable!=NULL&&strcmp(filename, curOpenFileTable->fileName)!=0)
+			curOpenFileTable = curOpenFileTable->next;
+		
+		if(curOpenFileTable!=NULL){
+			return vsfs_close(curOpenFileTable->fileDP);
+		}
+		//End of closing file
+		return 0;
+		
+	}else{
+		return -1;
+	}
+
+}
+
+int vsfs_read(int fd, void *buf, int n)//Önce writeı test et
+{
+	struct openFileTableNode * curOpenFileTable = openFileTablePointer;
+	
+	if(curOpenFileTable == NULL)
+		return -1;
+	
+	while(curOpenFileTable->fileDP!=fd && curOpenFileTable->next!=NULL)
+		curOpenFileTable = curOpenFileTable->next;
+	
+	if(curOpenFileTable->fileDP!=fd)
+		return -1;
+	
+
+	unsigned short startBlock = (curOpenFileTable->readWritePointer)/BLOCKSIZE;//Block of current file pointer
+	unsigned short finishBlock;
+	if((curOpenFileTable->readWritePointer + n)>curOpenFileTable->fileSize)
+		finishBlock = (curOpenFileTable->fileSize)/BLOCKSIZE;
+	else
+		finishBlock = (curOpenFileTable->readWritePointer+n)/BLOCKSIZE;		
+	if(startBlock==finishBlock){
+		
+		unsigned long curFatEntry = getFatEntryStartingPoint(curOpenFileTable->fileStartingBlock);
+		int i;
+		for(i=0; i<startBlock;i++)//Go to starting block
+			curFatEntry = getFatEntryStartingPoint(((unsigned short *)(curFatEntry+2))[0]);
+
+		int offset = curOpenFileTable->readWritePointer%BLOCKSIZE;//Starting offset inside block
+		
+		char * blockBuf = malloc(BLOCKSIZE);
+		getblock (((unsigned short *)curFatEntry)[0], blockBuf);
+		
+		int counter = n;
+		
+		for(i=0; i<counter; i++)//Read n bytes
+			((char*)(buf+i))[0] = ((char *)(blockBuf+offset+i))[0];
+		
+		curOpenFileTable->readWritePointer = curOpenFileTable->readWritePointer + counter;//Advance the file pointer
+		if(curOpenFileTable->readWritePointer=curOpenFileTable->fileSize)
+			curOpenFileTable->readWritePointer=0;
+		
+		return counter;
+	}else{
+		unsigned long curFatEntryStart = getFatEntryStartingPoint(curOpenFileTable->fileStartingBlock);
+		int i;
+		for(i=0; i<startBlock;i++)//Go to starting block
+			curFatEntryStart = getFatEntryStartingPoint((((unsigned short *)curFatEntryStart+2))[0]);
+
+		unsigned long curFatEntryEnd = getFatEntryStartingPoint(curOpenFileTable->fileStartingBlock);
+		for(i=0; i<finishBlock;i++)//Go to starting block
+			curFatEntryEnd = getFatEntryStartingPoint((((unsigned short *)curFatEntryEnd+2))[0]);
+		
+		int offset = curOpenFileTable->readWritePointer%BLOCKSIZE;//Starting offset inside block
+		
+		char * blockBuf1 = malloc(BLOCKSIZE);
+		getblock (((unsigned short *)curFatEntryStart)[0], blockBuf1);
+		
+		char * blockBuf2 = malloc(BLOCKSIZE);
+		getblock (((unsigned short *)curFatEntryEnd)[0], blockBuf2);
+		
+		int counter1 = BLOCKSIZE-curOpenFileTable->readWritePointer;
+
+		
+		for(i=0; i<counter1; i++)
+			((char*)(buf+i))[0] = ((char*)(blockBuf1+offset+i))[0];	
+		if(n+curOpenFileTable->readWritePointer>curOpenFileTable->fileSize){
+			for(; i<counter1+BLOCKSIZE; i++)//Read at the end of the file
+				((char*)(buf+i))[0] = ((char*)(blockBuf2+i))[0];
+			curOpenFileTable->readWritePointer = 0;//Advance the file pointer
+			return counter1+BLOCKSIZE;
+		}else{
+			for(; i<n; i++)
+				((char*)(buf+i))[0] = ((char*)(blockBuf2+i))[0];
+			curOpenFileTable->readWritePointer = curOpenFileTable->readWritePointer + n;//Advance the file pointer
+		}
+	}		
+	
+	return n; // if everything is OK
+
+}
+
+int vsfs_write(int fd, void *buf, int n)
+{
+	struct openFileTableNode * curOpenFileTable = openFileTablePointer;
+	
+	if(curOpenFileTable == NULL)
+		return -1;
+	
+	while(curOpenFileTable->fileDP!=fd&&curOpenFileTable->next!=NULL)
+		curOpenFileTable = curOpenFileTable->next;
+	
+	if(curOpenFileTable->fileDP!=fd)
+		return -1;//Above checks the existance of the entry in the open file table
+	
+	int numOfBlocksOfFile = curOpenFileTable->fileSize/BLOCKSIZE;//Num of blocks file uses
+	if(curOpenFileTable->fileSize%BLOCKSIZE!=0)
+		numOfBlocksOfFile++;//Add one if remainder was left
+	else if(curOpenFileTable->fileSize==0)//File should have at least on block
+		numOfBlocksOfFile++;
+	int blockOfCurrentPointer = curOpenFileTable->readWritePointer/BLOCKSIZE;//Block of current file pointer
+	
+	int numOfBlocksNeeded = (curOpenFileTable->readWritePointer+n)/BLOCKSIZE-blockOfCurrentPointer;//Calculates the num of blocks needed to write bytes
+	if((curOpenFileTable->readWritePointer+n)%BLOCKSIZE!=0)
+		numOfBlocksNeeded++;//Add one if remainder was left
+	
+	int numOfNewBlocksNeeded = (numOfBlocksNeeded) - (numOfBlocksOfFile - blockOfCurrentPointer);//Calculates the number of new blocks to be allocated
+	//printf("\nfileSize: %lu, numOfBlocksNeeded: %d, numofBlocksOfFile: %d, blockOfCurrentPointer: %d, numOfNewBlocksNeeded: %d", curOpenFileTable->fileSize,numOfBlocksNeeded, numOfBlocksOfFile, blockOfCurrentPointer, numOfNewBlocksNeeded);
+	
+	unsigned long curFatNode;
+	
+	if(numOfNewBlocksNeeded>0){//If new blocks needed to be allocated
+		if(testExistanceOfNumberOfFreeBlocks(numOfNewBlocksNeeded)==1){//If there are enough free blocks to allocate
+			curFatNode = getFatEntryStartingPoint(curOpenFileTable->fileStartingBlock);//Iterator for iteration over file blocks
+			while(((unsigned short*)(curFatNode+2))[0]!=0)
+				curFatNode = getFatEntryStartingPoint(((unsigned short *)(curFatNode+2))[0]);//Go to the last block of the file
+			allocateNewBlocks(curFatNode, numOfNewBlocksNeeded);//Allocates new blocks and linkes them together for file
+		}else
+			return -1;
+	}
+	char * buffer = malloc(BLOCKSIZE);//Buffer to get block, modify it and write it back
+	
+	curFatNode = getFatEntryStartingPoint(curOpenFileTable->fileStartingBlock);//Iterator for fat blocks of file
+	int i;
+	for(i=0; i<blockOfCurrentPointer; i++){
+		curFatNode = getFatEntryStartingPoint(((unsigned short *)(curFatNode+2))[0]);//Go to starting block where we will start writing
+	}
+	
+	getblock (((unsigned short *)curFatNode)[0], buffer);//Get the block where we will start writing
+	unsigned long offset = 0;//Keep the count of written bytes
+
+	for(i=curOpenFileTable->readWritePointer%BLOCKSIZE; i<BLOCKSIZE; i++){//Write bytes of first block starting from the file pointer at end of block
+		(buffer+i)[0] = ((char *)(buf+offset))[0];
+		offset++;
+	}
+	putblock(((unsigned short *)curFatNode)[0], buffer);//Write the first block back
+	
+	
+	for(i=0;i<numOfBlocksNeeded-2;i++){//Get other blocks except the last block, write to them and put them back
+		curFatNode = getFatEntryStartingPoint(((unsigned short*)(curFatNode+2))[0]);
+		getblock(((unsigned short*)curFatNode)[0], buffer);
+		int k;
+		for(k=0; k<BLOCKSIZE;k++){
+			(buffer+k)[0] = ((char *)(buf+offset))[0];
+			offset++;
+		}
+		putblock(((unsigned short*)curFatNode)[0], buffer);
+	}
+	
+	int lastBlockN = n-offset;//Calculate the number of bytes that will be written to the last block
+	curFatNode = getFatEntryStartingPoint(((unsigned short*)(curFatNode+2))[0]);//Get the last num from fat
+	
+	getblock(((unsigned short*)curFatNode)[0], buffer);
+	int k;
+	for(k=0; k<lastBlockN;k++){
+		(buffer+k)[0] = ((char *)(buffer+offset))[0];
+		offset++;
+	}
+	putblock(((unsigned short*)curFatNode)[0], buffer);
+	
+	curOpenFileTable->readWritePointer = curOpenFileTable->readWritePointer + n;
+	if(curOpenFileTable->readWritePointer>curOpenFileTable->fileSize){//If file size is increased set the new file size both in open file table and directory structure
+		curOpenFileTable->fileSize = curOpenFileTable->readWritePointer;
+		unsigned long curPointerForDirectory = directoryInMemoryPointer;
+	
+		while(((char*)curPointerForDirectory)[0]!='\0' && strcmp((char*)curPointerForDirectory, curOpenFileTable->fileName)!=0){
+			curPointerForDirectory += 140;
+		}
+		if(((char*)curPointerForDirectory)[0]!='\0'){//Sets new file size
+			setFileSizeFromDirectoryEntry(curPointerForDirectory, curOpenFileTable->fileSize);
+		}else
+			return -1;
+	}
+	
+
+	
+	return (n); // if everything is OK
+} 
+
+int vsfs_truncate(int fd, int size)
+{
+	struct openFileTableNode * curOpenFileTable = openFileTablePointer;
+	
+	if(curOpenFileTable == NULL)
+		return -1;
+	while(curOpenFileTable->fileDP!=fd&&curOpenFileTable->next!=NULL)
+		curOpenFileTable = curOpenFileTable->next;
+	
+	if(curOpenFileTable->fileDP!=fd)
+		return -1;//Above checks whether the file is opened and has entry in open file table or not
+	
+	if(curOpenFileTable->fileSize<size)//If desired new size is larger than fileSize then abort
+		return -1;
+	
+	
+	int currentBlockNum = curOpenFileTable->fileSize/BLOCKSIZE;//Calculate the num of blocks of the file
+	if(curOpenFileTable->fileSize%BLOCKSIZE)
+		currentBlockNum++;
+	int newBlockNum = size/BLOCKSIZE;//Calculate the new number of blocks that the file will have after truncate
+	if(size%BLOCKSIZE!=0)
+		newBlockNum++;
+	printf("\n\ncurrentBlockNum: %d, newBlockNum: %d\n\n", currentBlockNum, newBlockNum);
+	
+	char * curPointerForDirectory = directoryInMemoryPointer;//Iterator for directory in memory
+	while(curPointerForDirectory[0]!='\0'&&strcmp(curPointerForDirectory, curOpenFileTable->fileName)!=0){
+		curPointerForDirectory += 140;//Find the file in the directory
+	}
+	if(strcmp(curPointerForDirectory, curOpenFileTable->fileName)==0){//If file found
+		if(currentBlockNum==newBlockNum){//If there is no need to be deallocate blocks
+			setFileSizeFromDirectoryEntry(curPointerForDirectory, size);
+				curOpenFileTable->fileSize = size;
+			return 0;
+		}else{//If there is need to be deallocate blocks
+			unsigned short curFatNum1 = curOpenFileTable->fileStartingBlock;
+			int i;
+			for(i=0;i<newBlockNum-1;i++){//Find new last block
+				curFatNum1 = ((unsigned short*)(getFatEntryStartingPoint(curFatNum1)+2))[0];
+			}
+			
+			unsigned short curFatNum2 = curFatNum1;
+			while(((unsigned short*)(getFatEntryStartingPoint(curFatNum2)+2))[0]!= 0){
+				curFatNum2 = ((unsigned short*)(getFatEntryStartingPoint(curFatNum2)+2))[0];
+				//printf("\nhere");
+			}
+			((unsigned short*)(getFatEntryStartingPoint(curFatNum2)+2))[0] = getFirstFreeBlock();//Set the last blocks next to first free block
+			setFirstFreeBlock(((unsigned short*)(getFatEntryStartingPoint(curFatNum1)+2))[0]);//Sets the first block as first deallocated block
+			((unsigned short*)(getFatEntryStartingPoint(curFatNum1)+2))[0] = 0;//Set new last block's next as null
+			//
+			
+			/*unsigned long curFat1 = (getFatEntryStartingPoint(curOpenFileTable->fileStartingBlock));//Iterator 1 for fat table
+			int i;
+			for(i=0;i<newBlockNum;i++){//Find new last block
+				curFat1 = getFatEntryStartingPoint(((unsigned short *)(curFat1+1))[0]);
+				printf("\n\nNew last block: %d\n\n", i);
+			}
+			unsigned long curFat2 = curFat1;//Iterator 2 for fat table
+			while(((unsigned short *)(curFat2+1))[0]!= 0){
+				curFat2 = getFatEntryStartingPoint(((unsigned short *)(curFat2+1))[0]);
+				printf("\nhere");
+			}
+			printf("\n\nLast block: %hu\n\n", ((unsigned short *)(curFat2))[0]);
+			((unsigned short *)(curFat2+1))[0] = getFirstFreeBlock();//Set the last blocks next to first free block
+			
+			setFirstFreeBlock(((unsigned short*) (curFat1 + 1))[0]);//Sets the first block as first deallocated block
+			((unsigned short*) (curFat1 + 1))[0] = 0; //Set new last block's next as null*/
+			return 0;
+		}
+	}else{
+		return -1;
+	}
+	return 0;
+} 
+
+int vsfs_seek(int fd, int offset)//Bunu da test etmeye gerek yok artık
+{
+	struct openFileTableNode * curOpenFileTable = openFileTablePointer;//Iterator for open file table linked list
+	while(curOpenFileTable->fileDP!=fd&&curOpenFileTable->next!=NULL)
+		curOpenFileTable = curOpenFileTable->next;
+	
+	if(curOpenFileTable->fileDP!=fd)
+		return -1;//Above checks the existance of the corresponding entry in the open file table
+	
+	if(offset>curOpenFileTable->fileSize){//If offset is larger than file size make it equal to the file size
+		curOpenFileTable->readWritePointer = curOpenFileTable->fileSize;
+	}else if(offset<0){//If offset is less than 0 set file pointer to 0
+		curOpenFileTable->readWritePointer = 0;
+	}else{//In other possibilities set file pointer to offset
+		curOpenFileTable->readWritePointer = offset;
+	}
+} 
+
+int vsfs_filesize (int fd)//Bunu da test etmeye gerek yok artık
+{
+	struct openFileTableNode * curOpenFileTable = openFileTablePointer;
+	while(curOpenFileTable->fileDP!=fd&&curOpenFileTable->next!=NULL)
+		curOpenFileTable = curOpenFileTable->next;
+	
+	if(curOpenFileTable->fileDP!=fd)
+		return -1;
+	
+	return curOpenFileTable->fileSize;
+
+}
+
+void printBlocks(unsigned short blockNum){//Prints blocks of the file
+	int a = 1;
+	printf(" %d",((unsigned short*)getFatEntryStartingPoint(blockNum))[0]);
+	if(((unsigned short*)(getFatEntryStartingPoint(blockNum)+2))[0]== 0)
+		a = 0;
+	else
+		printBlocks(((unsigned short*)(getFatEntryStartingPoint(blockNum)+2))[0]);
+}
+
+void vsfs_print_dir ()//Test edildi
+{
+	char * curPointerForDirectory = directoryInMemoryPointer;//Iterator for directory structure in memory
+	while(curPointerForDirectory[0]!='\0'){//Iterates over directory entry
+		printf("\n%s", curPointerForDirectory);//Prints file name
+		curPointerForDirectory += 140;//Goes to next block
+	}
+	printf("\n");
+}
+
+void vsfs_print_fat ()//Test edildi
+{
+	char * curPointerForDirectory = directoryInMemoryPointer;//Iterator for directory structure in memory
+	if(curPointerForDirectory[0] == '\0')
+		printf("\nDirectroy is empty.");
+	while(curPointerForDirectory[0]!='\0'){//Iterates over directory entry
+		printf("\n%s:", curPointerForDirectory);//Prints file name
+		printBlocks(getFileStartingBlockAtFatFromDirectoryEntry(curPointerForDirectory));//Prints blocks of the file
+		curPointerForDirectory += 140;//Goes to next block
+	}
+	printf("\n");
+}
+
+

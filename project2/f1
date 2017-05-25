@@ -1,0 +1,25 @@
+2
+-3+4(*5
+
+
+
+'''test=$(echo $char | grep [0-9])
+			test=$?
+			if [[ $char == '(' ]]; then
+				echo "start with ("
+			elif [[ $char == ')' ]]; then
+				echo "start with number"
+			elif [[ $char == '+' ]]; then
+				echo "start with number"
+			elif [[ $char == '-' ]]; then
+				echo "start with number"
+			elif [[ $char == '*' ]]; then
+				echo "start with number"
+			elif [[ $char == '/' ]]; then
+				echo "start with number"
+			elif [[ "$test" -eq 0 ]]; then
+				echo "start with number"
+			else
+				valid[$i]="notValid"
+				break
+			fi'''
